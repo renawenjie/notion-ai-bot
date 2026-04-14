@@ -1,0 +1,17 @@
+{
+  "name": "notion-ai-bot",
+  "version": "2.0.0",
+  "description": "AI-powered Notion task assistant via Telegram",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "node-schedule": "^2.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
