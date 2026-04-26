@@ -42,6 +42,7 @@ async function fetchTasksThisWeek() {
         { property: "Deadline (date)", date: { on_or_before: endOfWeek } },
         { property: "Status", select: { does_not_equal: "Done" } },
         { property: "Status", select: { does_not_equal: "Cancelled" } },
+        { property: "Status", select: { does_not_equal: "Paused" } },
       ]
     },
     sorts: [
@@ -58,6 +59,7 @@ async function fetchAllActiveTasks() {
       and: [
         { property: "Status", select: { does_not_equal: "Done" } },
         { property: "Status", select: { does_not_equal: "Cancelled" } },
+        { property: "Status", select: { does_not_equal: "Paused" } },
       ]
     },
     sorts: [
@@ -89,6 +91,19 @@ async function updateTaskStatus(taskId, status) {
   });
 }
 
+async function createChecklist(pageId, items) {
+  // items: string[]
+  const children = items.map(text => ({
+    object: "block",
+    type: "to_do",
+    to_do: {
+      rich_text: [{ type: "text", text: { content: text } }],
+      checked: false,
+    },
+  }));
+  await notionRequest(`/blocks/${pageId}/children`, "PATCH", { children });
+}
+
 function parseTask(page) {
   const props = page.properties;
   return {
@@ -105,6 +120,32 @@ function parseTask(page) {
   };
 }
 
+// ─── Fetch page checklist items ──────────────────────────────────────────────
+
+async function fetchPageChecklist(pageId) {
+  try {
+    const data = await notionRequest(`/blocks/${pageId}/children`);
+    const items = [];
+    for (const block of data.results || []) {
+      if (block.type === "to_do") {
+        const text = block.to_do?.rich_text?.map(t => t.plain_text).join("") || "";
+        const checked = block.to_do?.checked || false;
+        if (text) items.push({ text, checked });
+      }
+    }
+    return items;
+  } catch {
+    return []; // silently skip if page can't be fetched
+  }
+}
+
+async function enrichTasksWithChecklists(tasks) {
+  return Promise.all(tasks.map(async t => {
+    const checklist = await fetchPageChecklist(t.id);
+    return { ...t, checklist };
+  }));
+}
+
 // ─── Claude AI ────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are a personal task assistant connected to the user's Notion "Action Items Tracker" database.
@@ -117,8 +158,10 @@ Database schema:
 - Importance: number (higher = more important)
 - Priority Score: formula, read-only
 - Tags: Work | Family | Travel | Personal | Child Care
-- Notes: text
+- Notes: text (context/background info)
+- Checklist: to-do items inside the task page, shown as [x] done or [ ] pending
 
+When the user asks about progress on a task or what to do next, reference the checklist items.
 You can perform these actions:
 - reschedule: update Deadline (date)
 - set_urgency: update Urgency field
@@ -129,11 +172,12 @@ Respond ONLY in this exact JSON format:
 {
   "message": "friendly plain-text reply for the user",
   "action": null | {
-    "type": "reschedule" | "set_urgency" | "set_status" | "mark_done",
+    "type": "reschedule" | "set_urgency" | "set_status" | "mark_done" | "create_checklist",
     "taskId": "page-uuid",
     "newDate": "YYYY-MM-DD",
     "urgency": "Today" | "This week" | "This month" | "This half" | "Not urgent",
-    "status": "Not started" | "In progress" | "Done" | "Paused" | "Cancelled"
+    "status": "Not started" | "In progress" | "Done" | "Paused" | "Cancelled",
+    "checklist": ["step 1", "step 2", "step 3"]
   }
 }
 
@@ -142,11 +186,17 @@ Rules:
 - If multiple tasks match ambiguously, ask for clarification and set action to null
 - Be concise and friendly
 - Today is ${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}
-- When rescheduling to named days like "Friday", calculate the correct ISO date`;
+- When rescheduling to named days like "Friday", calculate the correct ISO date
+- For create_checklist: generate 3-6 realistic, small, actionable steps based on the task name and context. Each step should be completable in 30 mins or less. Also auto set status to "In progress".`;
 
 async function askClaude(userMessage, tasks) {
   const tasksCtx = tasks.length > 0
-    ? tasks.map(t => `- [${t.id}] "${t.name}" | urgency: ${t.urgency || "none"} | deadline: ${t.deadline || "none"} | status: ${t.status} | priority: ${t.priorityScore ?? "?"} | tags: ${t.tags.join(", ") || "none"}`).join("\n")
+    ? tasks.map(t => {
+        const checklistStr = t.checklist?.length
+          ? "\n    Checklist: " + t.checklist.map(c => `[${c.checked ? "x" : " "}] ${c.text}`).join(", ")
+          : "";
+        return `- [${t.id}] "${t.name}" | urgency: ${t.urgency || "none"} | deadline: ${t.deadline || "none"} | status: ${t.status} | priority: ${t.priorityScore ?? "?"} | tags: ${t.tags.join(", ") || "none"}${checklistStr}`;
+      }).join("\n")
     : "No active tasks.";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -188,30 +238,131 @@ const getUpdates = (offset) => telegramRequest("getUpdates", { offset, timeout: 
 
 // ─── Morning Digest ───────────────────────────────────────────────────────────
 
-function formatDigest(tasks) {
-  const todayTasks = tasks.filter(t => t.urgency === "Today");
-  const weekTasks  = tasks.filter(t => t.urgency === "This week");
-  const otherTasks = tasks.filter(t => !["Today", "This week"].includes(t.urgency) && t.deadline);
+async function fetchOverdueTasks() {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayISO = yesterday.toISOString().split("T")[0];
+  const data = await notionRequest(`/databases/${NOTION_DATABASE_ID}/query`, "POST", {
+    filter: {
+      and: [
+        { property: "Deadline (date)", date: { before: todayISO() } },
+        { property: "Status", select: { does_not_equal: "Done" } },
+        { property: "Status", select: { does_not_equal: "Cancelled" } },
+        { property: "Status", select: { does_not_equal: "Paused" } },
+      ]
+    },
+    sorts: [{ property: "Deadline (date)", direction: "ascending" }],
+  });
+  return data.results.map(parseTask);
+}
 
-  const line = t => {
-    const tag = t.tags.length ? ` [${t.tags.join(", ")}]` : "";
-    const dl = t.deadline ? ` — ${formatDate(t.deadline)}` : "";
-    return `  • ${t.name}${tag}${dl}`;
+function formatDigest(tasks, overdueTasks) {
+  const today = todayISO();
+
+  // Status icon inline
+  const statusLabel = t => t.status === "In progress" ? "In progress" : "Not started";
+
+  // Task line: priority-ranked, status inline, deadline
+  const taskLine = t => {
+    const dl = t.deadline ? ` · ${formatDate(t.deadline)}` : "";
+    const status = statusLabel(t);
+    const checklist = t.checklist || [];
+    const done = checklist.filter(c => c.checked).length;
+    const total = checklist.length;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    const progress = total > 0 ? ` · ${done}/${total} done (${pct}%)` : "";
+    return `  • ${t.name} [${status}]${progress}${dl}`;
   };
 
-  let msg = `Good morning! ${new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })}\n\n`;
-  msg += "TODAY\n" + (todayTasks.length ? todayTasks.map(line).join("\n") : "  Nothing marked as Today.");
-  if (weekTasks.length) msg += "\n\nTHIS WEEK\n" + weekTasks.map(line).join("\n");
-  if (otherTasks.length) msg += "\n\nCOMING UP\n" + otherTasks.map(line).join("\n");
-  msg += `\n\n${tasks.length} active task${tasks.length !== 1 ? "s" : ""} total. Reply to update, reschedule, or ask anything.`;
+  const overdueLine = t => {
+    const daysAgo = Math.floor((new Date(today) - new Date(t.deadline)) / 86400000);
+    const status = statusLabel(t);
+    const checklist = t.checklist || [];
+    const done = checklist.filter(c => c.checked).length;
+    const total = checklist.length;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    const progress = total > 0 ? ` · ${done}/${total} done (${pct}%)` : "";
+    return `  • ${t.name} [${status}]${progress} · ${daysAgo}d ago`;
+  };
+
+  // Neutral, calm greetings — no hype
+  const greetings = [
+    "Morning. Here's where things stand today.",
+    "Good morning. Here's your day at a glance.",
+    "Morning. Here's what's on your plate.",
+    "Good morning. Here's your focus for today.",
+    "Morning. Here's what's ahead.",
+    "Good morning. Here's your plan.",
+    "Morning. Here's a look at your week.",
+  ];
+  const dateStr = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" });
+  const greeting = greetings[new Date().getDay()];
+
+  let msg = `${greeting}
+${dateStr}
+`;
+
+  // Overdue — self-compassion + autonomy framing, no guilt
+  if (overdueTasks.length > 0) {
+    // Sort overdue by priority score desc
+    const sorted = [...overdueTasks].sort((a, b) => (b.priorityScore || 0) - (a.priorityScore || 0));
+    msg += `
+Carried forward — still worth doing:
+`;
+    sorted.forEach(t => { msg += overdueLine(t) + "
+"; });
+  }
+
+  // This week + today tasks sorted by priority score desc
+  if (tasks.length > 0) {
+    const sorted = [...tasks].sort((a, b) => (b.priorityScore || 0) - (a.priorityScore || 0));
+    const todayTasks = sorted.filter(t => t.urgency === "Today");
+    const restTasks  = sorted.filter(t => t.urgency !== "Today");
+
+    if (todayTasks.length) {
+      msg += `
+Focus for today:
+`;
+      todayTasks.forEach(t => { msg += taskLine(t) + "
+"; });
+    }
+
+    if (restTasks.length) {
+      msg += `
+This week:
+`;
+      restTasks.forEach(t => { msg += taskLine(t) + "
+"; });
+    }
+  }
+
+  // Progress summary — progress principle
+  const allTasks = [...overdueTasks, ...tasks];
+  const inProgress = allTasks.filter(t => t.status === "In progress").length;
+  const total = allTasks.length;
+
+  if (inProgress > 0) {
+    msg += `
+${inProgress} already in motion out of ${total} total — keep going.`;
+  } else {
+    msg += `
+${total} task${total !== 1 ? "s" : ""} on your radar this week.`;
+  }
+
+  msg += `
+Reply to update any task, or just ask what to focus on first.`;
   return msg;
 }
+
 
 async function sendMorningDigest() {
   console.log(`[${new Date().toISOString()}] Sending digest...`);
   try {
-    const tasks = await fetchTasksThisWeek();
-    await sendMessage(TELEGRAM_CHAT_ID, formatDigest(tasks));
+    const [tasks, overdueTasks] = await Promise.all([
+      fetchTasksThisWeek(),
+      fetchOverdueTasks(),
+    ]);
+    await sendMessage(TELEGRAM_CHAT_ID, formatDigest(tasks, overdueTasks));
     console.log("✅ Digest sent");
   } catch (err) { console.error("❌ Digest error:", err.message); }
 }
@@ -220,7 +371,8 @@ async function sendMorningDigest() {
 
 async function handleMessage(text) {
   console.log(`Handling: "${text}"`);
-  const tasks = await fetchAllActiveTasks();
+  const rawTasks = await fetchAllActiveTasks();
+  const tasks = await enrichTasksWithChecklists(rawTasks);
   const { message, action } = await askClaude(text, tasks);
 
   if (action?.taskId) {
@@ -228,6 +380,10 @@ async function handleMessage(text) {
     else if (action.type === "set_urgency" && action.urgency) await updateTaskUrgency(action.taskId, action.urgency);
     else if (action.type === "set_status" && action.status) await updateTaskStatus(action.taskId, action.status);
     else if (action.type === "mark_done") await updateTaskStatus(action.taskId, "Done");
+    else if (action.type === "create_checklist" && action.checklist?.length) {
+      await createChecklist(action.taskId, action.checklist);
+      await updateTaskStatus(action.taskId, "In progress");
+    }
   }
 
   await sendMessage(TELEGRAM_CHAT_ID, message);
