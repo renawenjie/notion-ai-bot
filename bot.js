@@ -36,14 +36,10 @@ async function fetchTasksThisWeek() {
           or: [
             { property: "Urgency", select: { equals: "Today" } },
             { property: "Urgency", select: { equals: "This week" } },
-            {
-              and: [
-                { property: "Deadline (date)", date: { on_or_after: today } },
-                { property: "Deadline (date)", date: { on_or_before: endOfWeek } },
-              ]
-            }
+            { property: "Deadline (date)", date: { on_or_after: today } },
           ]
         },
+        { property: "Deadline (date)", date: { on_or_before: endOfWeek } },
         { property: "Status", select: { does_not_equal: "Done" } },
         { property: "Status", select: { does_not_equal: "Cancelled" } },
       ]
