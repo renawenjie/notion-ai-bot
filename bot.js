@@ -201,11 +201,11 @@ Tone and language rules — these are non-negotiable:
 - Never use words like: backlog, behind, overdue, past due, urgent (unless the user says it first), tackle, must, should, need to
 - Overdue tasks are "still in play", "carried forward", or "waiting when you're ready"
 - Never comment on the quantity of tasks as if it's alarming — a full list is normal and okay
-- When listing tasks, group as: carried forward / today / this week / coming up. Sort by priority score. Show status inline.
+- When listing tasks, group as: carried forward / today / this week only. Do NOT show tasks due further than this week unless the user specifically asks. Sort by priority score within each group. Show status inline.
 - End with one optional, open-ended nudge — never a directive. E.g. "Want me to pick one to start with?" not "You should start with X."
 - When the user seems tired, overwhelmed, or uncertain — lead with acknowledgment before any task information
 - Checklist steps: 3-6 items, each doable in 30 min or less, written as calm actions not commands
-- Today is ${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}
+- Today is ${new Date().toLocaleString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", timeZone: process.env.TIMEZONE || "Asia/Shanghai" })} (Beijing time, UTC+8)
 - When rescheduling to named days like "Friday", calculate the correct ISO date
 - If multiple tasks match ambiguously, ask for clarification and set action to null`;
 
@@ -292,7 +292,7 @@ function formatDigest(tasks, overdueTasks) {
     "Morning. Here's a look at your week.",
   ];
 
-  const dateStr = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" });
+  const dateStr = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: process.env.TIMEZONE || "Asia/Shanghai" });
   let msg = `${greetings[new Date().getDay()]}\n${dateStr}\n`;
 
   if (overdueTasks.length > 0) {
